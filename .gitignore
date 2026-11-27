@@ -1,0 +1,17 @@
+# 构建产物
+*.dylib
+out/
+build/
+.theos/
+packages/
+
+# 绝对不要提交原始 IPA / 脱壳产物（体积 + 版权）
+*.ipa
+*.app/
+*.appex/
+*.dSYM/
+Payload/
+
+# 本地分析产物
+*.txt.bak
+dump/
