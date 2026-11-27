@@ -20,7 +20,7 @@
 #import <ctype.h>
 #import <stdarg.h>
 
-#define SD_VERSION   @"0.4.1"
+#define SD_VERSION   @"0.4.2"
 #define SD_BTN_TAG   0x5B0D1E
 #define SD_MAX_TEXT  (64 * 1024)
 
@@ -45,7 +45,9 @@ static NSString *SDTrim(NSString *s, NSUInteger n) {
 static NSMutableArray<NSString *> *gRequests;          // "GET url"
 static NSMutableArray<NSDictionary *> *gCaptures;      // {url,status,headers,body}
 static NSMutableArray<NSString *> *gProviderCfgs;      // NE providerConfiguration 转储
-static NSString *gBestYAML;                           // 最近扫到的最完整 config.yaml 全文
+static NSString *gBestYAML;                           // config.yaml 全文
+static NSString *gBestProxies;                        // proxies: 段（节点本体）
+static NSString *gBestProviders;                      // proxy-providers: 段（订阅源）
 static NSLock *gLock;
 
 #pragma mark - URL 提取
@@ -663,7 +665,7 @@ static void SDShowAlert(NSString *title, NSString *message) {
 
     UIButton *yamlBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     yamlBtn.translatesAutoresizingMaskIntoConstraints = NO;
-    [yamlBtn setTitle:@"YAML" forState:UIControlStateNormal];
+    [yamlBtn setTitle:@"节点" forState:UIControlStateNormal];
     [yamlBtn addTarget:self action:@selector(copyYAML)
       forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:yamlBtn];
@@ -747,14 +749,18 @@ static void SDShowAlert(NSString *title, NSString *message) {
 
 - (void)copyYAML {
     [gLock lock];
-    NSString *yaml = [gBestYAML copy];
+    NSString *proxies = [gBestProxies copy];
+    NSString *providers = [gBestProviders copy];
+    NSString *full = [gBestYAML copy];
     [gLock unlock];
-    if (!yaml.length) {
+
+    NSString *payload = proxies.length ? proxies : (providers.length ? providers : full);
+    if (!payload.length) {
         [self flashTitle:@"没有 yaml"];
         return;
     }
-    UIPasteboard.generalPasteboard.string = yaml;
-    [self flashTitle:@"已复制 YAML"];
+    UIPasteboard.generalPasteboard.string = payload;
+    [self flashTitle:(proxies.length ? @"已复制 proxies" : @"已复制 providers")];
 }
 
 - (void)flashTitle:(NSString *)text {
@@ -978,6 +984,8 @@ static void SDRunScan(NSString *reason) {
     if (!bestYAML && yamlFiles.count) bestYAML = yamlFiles.firstObject;
     [gLock lock];
     gBestYAML = bestYAML[@"text"] ?: @"";
+    gBestProxies = bestYAML[@"proxies"] ?: @"";
+    gBestProviders = bestYAML[@"providers"] ?: @"";
     [gLock unlock];
 
     // 3. 响应分类
@@ -1026,7 +1034,7 @@ static void SDRunScan(NSString *reason) {
         [cand appendString:@"  （没找到 config.yaml，可能还没连过一次 VPN）\n"];
     }
     if (yamlLines.count) {
-        [cand appendString:@"  （点顶部「YAML」按钮可复制整份 config.yaml）\n"];
+        [cand appendString:@"  （点顶部「节点」按钮复制 proxies: 段整段）\n"];
     }
     for (NSString *y in yamlLines) [cand appendFormat:@"%@\n", SDTrim(y, 6000)];
 
