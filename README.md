@@ -7,15 +7,16 @@
 
 ## 原理
 
-Swift 方法不好按名字 hook，所以完全不走 hook 业务逻辑的路子，改成三路取证：
+Swift 方法不好按名字 hook，所以完全不走 hook 业务逻辑的路子，改成四路取证：
 
 | 路线 | 做法 | 能拿到什么 |
 |---|---|---|
-| A. 沙盒文件 | 递归扫描 App 沙盒里所有 ≤40MB 的文件，从原始字节里提取 `http(s)://` | Core Data 里 `Panel.link`、缓存的面板 JSON |
-| B. UserDefaults | 全量导出 `dictionaryRepresentation` | `AppsConnectDirectSubscriptions`、`AppsConnectPanelURL`、`AppsConnectPanelTOKEN` |
-| C. 网络观测 | 用 `method_setImplementation` 挂 `NSURLSession` / `NSURLSessionTask` | 所有请求 URL + 订阅/面板响应的正文和 `subscription-userinfo` 头 |
+| A. 沙盒 + AppGroup | 递归扫描 `NSHomeDirectory()` **和 entitlements 里的 App Group 容器**（NE 要读配置，config.yaml 通常在这），把 yaml 里的 `proxies:` / `proxy-providers:` 段落直接摘出来 | **明文 config.yaml**、`proxy-providers` 里的订阅 url |
+| B. 响应分类 | 抓 `NSURLSession` 的响应体，按**内容**判断类型（Clash YAML / base64 节点列表 / JSON 面板数据），不靠 URL 关键词猜 | 订阅内容、`link` 字段、`subscription-userinfo` 流量头 |
+| C. NE 配置 | hook `-[NETunnelProviderProtocol setProviderConfiguration:]` | App 可能把整份配置塞给 NE，这条路能直接拿到 |
+| D. UserDefaults | 全量导出 `dictionaryRepresentation` | `AppsConnectDirectSubscriptions`、`AppsConnectPanelURL` |
 
-零依赖：不链接 CydiaSubstrate / ElleKit / Logos，只用 objc runtime，所以 TrollStore 注入后可以直接加载，不会因为缺库崩溃。
+零依赖：不链接 CydiaSubstrate / ElleKit / Logos，只用 objc runtime + dlsym，TrollStore 注入后可以直接加载，不会因为缺库崩溃。
 
 ## 构建（GitHub Actions，免费）
 
@@ -44,23 +45,35 @@ git push -u origin main
 
 ## 使用
 
-注入成功后，App 启动 **3 秒**会弹出一个可滚动的结果面板，同时**候选链接已复制到剪贴板**。
+注入成功后，App 启动 **3 秒**会弹出结果面板，同时把最有把握的链接复制到剪贴板。
 
-面板上三个按钮：
+默认页是「关键线索」，分成 5 段，按可信度排：
 
-- **全部 / 候选**：默认显示「候选链接」（已按可能性排序：`/subscribe`、`token=`、`panel`、`relay` 加分，规则集 `.mrs/.dat` 减分）；点「全部」看 UserDefaults、沙盒命中、网络请求、响应体全文
-- **复制**：复制当前页内容
-- **关闭**：直接关掉
+| 段 | 内容 | 怎么用 |
+|---|---|---|
+| 【1】NE 配置转储 | `providerConfiguration` 里的键值，可能含整份 yaml | 找 `url` / `config` 开头的键 |
+| 【2】订阅类响应 | 按**内容**判定：Clash YAML、base64 节点列表、带 `subscription-userinfo` 头 | 这里的 URL 就是订阅地址 |
+| 【3】本地 yaml 配置 | 扫到的 `config.yaml` / `config_archive.yaml` 的 `proxies:` / `proxy-providers:` 段落 | 有 `proxy-providers: url:` 直接就是订阅链接；否则可把这段导入 Loon |
+| 【4】面板类 JSON | 从响应体里挖出的 `link` / `url` / `token` / `plan` / `expired` / `residue` 等字段 | `link` 一般就是订阅地址 |
+| 【5】候选链接 | 过滤掉规则集、测速、文档后的 URL，按分数排序，最多 40 条 | 兜底 |
 
-结果**只存在于内存和剪贴板**，App 沙盒里不写任何文件。App 重启后重新扫。
+点「全部」能看到完整细节：所有响应、所有请求、UserDefaults、文件命中、全部 URL。
 
-**什么都没抓到的话**：回 App 里进「订阅管理 / 面板」点一次「刷新」，然后再点一次左上角的 🔗 悬浮球重新扫描。
+结果**只存在于内存和剪贴板**，App 沙盒里不写任何文件。
+
+**第 2、3 段是空的**：说明配置还没落地。进 App 里连一次 VPN（或点一次「刷新订阅」），再按左上角 🔗 重新扫描。
 
 ## 怎么认哪条是订阅链接
 
-- 形如 `https://xxx/api/v1/client/subscribe?token=xxxx`、`https://xxx/sub?token=xxxx`、`.../link/xxxx?clash=1`
-- 在「全部」页的第 4 节「响应体」里，如果看到 `proxies:` 开头的 YAML，说明订阅内容本身已经抓到了，链接就在对应那条请求的 URL 里
-- 面板接口（`relay.php` / `api/v1/app/...`）返回的 JSON 里也会带 `link` 字段
+优先级从高到低：
+
+1. 【3】里 `proxy-providers:` 下面的 `url:` —— 这就是标准的订阅地址
+2. 【2】里 `[Clash YAML]` 那一条的 URL —— 服务器直接返回 yaml 的订阅
+3. 【2】里带 `subscription-userinfo` 头的那条 —— 机场标准订阅接口
+4. 【4】里 `link` / `url` 字段的值
+5. 形如 `https://xxx/api/v1/client/subscribe?token=xxxx`、`https://xxx/sub?token=xxxx`、`.../link/xxxx?clash=1`
+
+如果【3】只有内联的 `proxies:` 而没有 `proxy-providers`，说明这个服务**不下发订阅链接**，配置是 App 本地拼的。那就把 `proxies:` 段落整个复制出来，存成 `.yaml` 文件，Loon 支持直接导入 Clash 配置（节点会进去，但不会自动更新）。
 
 ## 拿到链接之后
 
