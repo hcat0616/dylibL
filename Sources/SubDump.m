@@ -334,7 +334,7 @@ static void SDScanFiles(NSArray<NSString *> *roots,
                             [yamlLines addObject:[NSString stringWithFormat:
                                 @"== %@  (%.1f KB, 约 %lu 个节点)\n%@",
                                 full, size / 1024.0, (unsigned long)nodes, snip]];
-                            [allURLs unionOrderedSet:SDExtractURLsFromString:snip];
+                            [allURLs unionOrderedSet:SDExtractURLsFromString(snip)];
                         }
                     }
                 }
