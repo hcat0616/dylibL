@@ -10,14 +10,14 @@
 //        A. 沙盒内所有文件里的 http(s) URL
 //        B. NSUserDefaults 全量键值
 //        C. NSURLSession 的请求 URL + 响应体（订阅 YAML / 面板 JSON 都能拿到）
-//   4. 结果三重落地：弹窗、剪贴板、Documents/SubDump.txt
+//   4. 结果只放内存：可滚动面板 + 剪贴板，不写任何文件
 
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <stdarg.h>
 
-#define SD_VERSION   @"0.2.0"
+#define SD_VERSION   @"0.3.0"
 #define SD_BTN_TAG   0x5B0D1E
 
 #pragma mark - 日志
@@ -349,10 +349,15 @@ static UIWindow *SDKeyWindow(void) {
     return app.windows.firstObject;
 }
 
-static void SDShowAlert(NSString *title, NSString *message) {
+static UIViewController *SDTopViewController(void) {
     UIWindow *win = SDKeyWindow();
     UIViewController *vc = win.rootViewController;
     while (vc.presentedViewController) vc = vc.presentedViewController;
+    return vc;
+}
+
+static void SDShowAlert(NSString *title, NSString *message) {
+    UIViewController *vc = SDTopViewController();
     if (!vc) return;
 
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
@@ -364,9 +369,154 @@ static void SDShowAlert(NSString *title, NSString *message) {
     [vc presentViewController:ac animated:YES completion:nil];
 }
 
+// 只存在内存里的结果面板：可滚动、可长按选取、可一键复制。
+// 不写任何文件，App 沙盒不留痕。
+@interface SDReportVC : UIViewController
+@property (nonatomic, copy) NSString *candidates;   // 候选链接（默认显示）
+@property (nonatomic, copy) NSString *details;      // 全部细节（点「全部」切换）
+@property (nonatomic, strong) UITextView *textView;
+@property (nonatomic, strong) UILabel *titleLabel;
+@property (nonatomic, strong) UIButton *switchBtn;
+@property (nonatomic, assign) BOOL showingDetails;
+@end
+
+@implementation SDReportVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [UIColor colorWithWhite:0.0 alpha:0.55];
+
+    UIView *card = [[UIView alloc] init];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = [UIColor systemBackgroundColor];
+    card.layer.cornerRadius = 14;
+    card.clipsToBounds = YES;
+    [self.view addSubview:card];
+
+    self.titleLabel = [[UILabel alloc] init];
+    self.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+    [card addSubview:self.titleLabel];
+
+    self.switchBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.switchBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.switchBtn setTitle:@"全部" forState:UIControlStateNormal];
+    [self.switchBtn addTarget:self action:@selector(toggleMode)
+             forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:self.switchBtn];
+
+    UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    copyBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [copyBtn setTitle:@"复制" forState:UIControlStateNormal];
+    [copyBtn addTarget:self action:@selector(copyAll)
+      forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:copyBtn];
+
+    UIButton *closeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    closeBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [closeBtn setTitle:@"关闭" forState:UIControlStateNormal];
+    [closeBtn addTarget:self action:@selector(closeSelf)
+       forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:closeBtn];
+
+    self.textView = [[UITextView alloc] init];
+    self.textView.translatesAutoresizingMaskIntoConstraints = NO;
+    self.textView.editable = NO;
+    self.textView.selectable = YES;
+    self.textView.alwaysBounceVertical = YES;
+    self.textView.font = [UIFont monospacedSystemFontOfSize:11 weight:UIFontWeightRegular];
+    self.textView.textContainerInset = UIEdgeInsetsMake(8, 8, 8, 8);
+    self.textView.backgroundColor = [UIColor secondarySystemBackgroundColor];
+    self.textView.layer.cornerRadius = 10;
+    self.textView.clipsToBounds = YES;
+    [card addSubview:self.textView];
+
+    UILayoutGuide *g = self.view.safeAreaLayoutGuide;
+    [NSLayoutConstraint activateConstraints:@[
+        [card.leadingAnchor constraintEqualToAnchor:g.leadingAnchor constant:14],
+        [card.trailingAnchor constraintEqualToAnchor:g.trailingAnchor constant:-14],
+        [card.centerYAnchor constraintEqualToAnchor:g.centerYAnchor],
+        [card.heightAnchor constraintEqualToAnchor:g.heightAnchor multiplier:0.64],
+
+        [self.titleLabel.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:16],
+        [self.titleLabel.topAnchor constraintEqualToAnchor:card.topAnchor constant:14],
+
+        [closeBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+        [closeBtn.centerYAnchor constraintEqualToAnchor:self.titleLabel.centerYAnchor],
+        [copyBtn.trailingAnchor constraintEqualToAnchor:closeBtn.leadingAnchor constant:-10],
+        [copyBtn.centerYAnchor constraintEqualToAnchor:self.titleLabel.centerYAnchor],
+        [self.switchBtn.trailingAnchor constraintEqualToAnchor:copyBtn.leadingAnchor constant:-10],
+        [self.switchBtn.centerYAnchor constraintEqualToAnchor:self.titleLabel.centerYAnchor],
+
+        [self.textView.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
+        [self.textView.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-12],
+        [self.textView.topAnchor constraintEqualToAnchor:self.titleLabel.bottomAnchor constant:10],
+        [self.textView.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-12],
+    ]];
+
+    [self render];
+}
+
+- (void)render {
+    BOOL details = self.showingDetails;
+    self.textView.text = details ? self.details : self.candidates;
+    self.titleLabel.text = details ? @"SubDump 全部细节" : @"SubDump 候选链接";
+    [self.switchBtn setTitle:(details ? @"候选" : @"全部") forState:UIControlStateNormal];
+}
+
+- (void)toggleMode {
+    self.showingDetails = !self.showingDetails;
+    [self render];
+    [self.textView setContentOffset:CGPointZero animated:NO];
+}
+
+- (void)copyAll {
+    NSString *text = self.showingDetails ? self.details : self.candidates;
+    if (text.length) {
+        UIPasteboard.generalPasteboard.string = text;
+    }
+    [self closeSelf];
+}
+
+- (void)closeSelf {
+    [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+@end
+
+static void SDShowReport(NSString *candidates, NSString *details) {
+    UIViewController *vc = SDTopViewController();
+    if (!vc) return;
+    SDReportVC *r = [[SDReportVC alloc] init];
+    r.candidates = candidates;
+    r.details = details;
+    r.modalPresentationStyle = UIModalPresentationOverFullScreen;
+    r.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
+    [vc presentViewController:r animated:YES completion:nil];
+}
+
+static NSInteger SDScore(NSString *u) {
+    NSString *l = u.lowercaseString;
+    NSInteger s = 0;
+    if ([l containsString:@"/subscribe"]) s += 12;
+    if ([l containsString:@"/sub?"]) s += 10;
+    if ([l containsString:@"token="]) s += 8;
+    if ([l containsString:@"userinfo"]) s += 6;
+    if ([l containsString:@"sub"]) s += 6;
+    if ([l containsString:@"relay"]) s += 5;
+    if ([l containsString:@"panel"]) s += 5;
+    if ([l containsString:@"clash"]) s += 4;
+    if ([l containsString:@"skynet"] || [l containsString:@"skyapp"]) s += 4;
+    if ([l containsString:@"config"]) s += 3;
+    if ([l containsString:@"jsdelivr"] || [l containsString:@"gstatic"] ||
+        [l containsString:@"t.me/"] || [l containsString:@"apps.apple.com"]) s -= 8;
+    if ([l hasSuffix:@".mrs"] || [l hasSuffix:@".dat"] || [l hasSuffix:@".mmdb"]) s -= 10;
+    return s;
+}
+
 #pragma mark - 扫描主流程
 
-static NSString *SDRunScan(NSString *reason) {
+static void SDRunScan(NSString *reason) {
     NSMutableArray<NSString *> *flat = [NSMutableArray array];
     NSMutableArray<NSString *> *fileLines = [NSMutableArray array];
     NSMutableOrderedSet<NSString *> *allURLs = [NSMutableOrderedSet orderedSet];
@@ -405,68 +555,53 @@ static NSString *SDRunScan(NSString *reason) {
         [interesting unionOrderedSet:SDExtractURLsFromString(c)];
     }
 
-    // 4. 组装报告
-    NSMutableString *report = [NSMutableString string];
-    [report appendFormat:@"SubDump %@\n时间: %@\n触发: %@\n\n", SD_VERSION, [NSDate date], reason];
+    // 4. 候选排序：越像订阅链接的越靠前
+    NSArray<NSString *> *ranked =
+        [[interesting array] sortedArrayUsingComparator:^NSComparisonResult(NSString *a, NSString *b) {
+            NSInteger sa = SDScore(a), sb = SDScore(b);
+            if (sa == sb) return NSOrderedSame;
+            return sa > sb ? NSOrderedAscending : NSOrderedDescending;
+        }];
 
-    [report appendFormat:@"=== 0. 候选链接（%lu）===\n", (unsigned long)interesting.count];
-    for (NSString *u in interesting) [report appendFormat:@"%@\n", u];
-
-    [report appendFormat:@"\n=== 1. UserDefaults（%lu）===\n", (unsigned long)flat.count];
-    for (NSString *s in flat) [report appendFormat:@"%@\n", s];
-
-    [report appendString:@"\n=== 2. 沙盒文件命中 ===\n"];
-    for (NSString *s in fileLines) [report appendFormat:@"%@\n", s];
-
-    [report appendFormat:@"\n=== 3. 网络请求（%lu）===\n", (unsigned long)reqs.count];
-    for (NSString *s in reqs) [report appendFormat:@"%@\n", s];
-
-    [report appendFormat:@"\n=== 4. 响应体（%lu）===\n", (unsigned long)caps.count];
-    for (NSString *s in caps) [report appendFormat:@"%@\n\n", s];
-
-    [report appendFormat:@"\n=== 5. 全部 URL（%lu）===\n", (unsigned long)allURLs.count];
-    for (NSString *s in allURLs) [report appendFormat:@"%@\n", s];
-
-    // 5. 落盘
-    NSString *docs = [NSSearchPathForDirectoriesInDomains(NSDocumentDirectory,
-                                                          NSUserDomainMask, YES) firstObject];
-    if (!docs.length) docs = NSHomeDirectory();
-    NSString *path = [docs stringByAppendingPathComponent:@"SubDump.txt"];
-    @try {
-        [report writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:NULL];
-    } @catch (__unused NSException *e) {}
-
-    // 6. 剪贴板（只放候选，方便直接粘到 Loon）
-    NSString *clip = [[interesting array] componentsJoinedByString:@"\n"];
-    if (clip.length) {
-        @try { UIPasteboard.generalPasteboard.string = clip; } @catch (__unused NSException *e) {}
+    // 5. 两份文本，全部只存在于内存，不落盘
+    NSMutableString *cand = [NSMutableString string];
+    [cand appendFormat:@"共 %lu 条（按可能性排序）\n\n", (unsigned long)ranked.count];
+    for (NSString *u in ranked) [cand appendFormat:@"%@\n\n", u];
+    if (ranked.count == 0) {
+        [cand appendString:@"暂时没抓到。\n请回 App 里点一次「刷新」订阅/面板，再按左上角 🔗。"];
     }
 
-    // 7. 弹窗
-    NSMutableString *msg = [NSMutableString string];
-    [msg appendFormat:@"候选 %lu 条，全部 URL %lu 条。\n",
-     (unsigned long)interesting.count, (unsigned long)allURLs.count];
-    NSUInteger shown = 0;
-    for (NSString *u in interesting) {
-        if (shown >= 4 || msg.length > 700) break;
-        NSString *oneLine = u.length > 180 ? [u substringToIndex:180] : u;
-        [msg appendFormat:@"\n%@", oneLine];
-        shown++;
-    }
-    if (interesting.count) {
-        [msg appendString:@"\n\n已复制到剪贴板。"];
-    } else {
-        [msg appendString:@"\n暂时没抓到。请回 App 里点一次「刷新」订阅/面板，再按左上角 🔗。"];
-    }
-    [msg appendFormat:@"\n完整报告：Documents/SubDump.txt"];
+    NSMutableString *details = [NSMutableString string];
+    [details appendFormat:@"SubDump %@   %@   触发=%@\n\n", SD_VERSION, [NSDate date], reason];
+    [details appendFormat:@"=== 候选（%lu）===\n", (unsigned long)ranked.count];
+    for (NSString *u in ranked) [details appendFormat:@"%@\n", u];
+    [details appendFormat:@"\n=== UserDefaults（%lu）===\n", (unsigned long)flat.count];
+    for (NSString *s in flat) [details appendFormat:@"%@\n", s];
+    [details appendString:@"\n=== 沙盒文件命中 ===\n"];
+    for (NSString *s in fileLines) [details appendFormat:@"%@\n", s];
+    [details appendFormat:@"\n=== 网络请求（%lu）===\n", (unsigned long)reqs.count];
+    for (NSString *s in reqs) [details appendFormat:@"%@\n", s];
+    [details appendFormat:@"\n=== 响应体（%lu）===\n", (unsigned long)caps.count];
+    for (NSString *s in caps) [details appendFormat:@"%@\n\n", s];
+    [details appendFormat:@"\n=== 全部 URL（%lu）===\n", (unsigned long)allURLs.count];
+    for (NSString *s in allURLs) [details appendFormat:@"%@\n", s];
 
+    // 6. 剪贴板：只放候选，方便直接粘到 Loon
+    if (ranked.count) {
+        @try {
+            UIPasteboard.generalPasteboard.string = [ranked componentsJoinedByString:@"\n"];
+        } @catch (__unused NSException *e) {}
+    }
+
+    // 7. 内存面板展示
+    NSString *candText = [cand copy];
+    NSString *detailText = [details copy];
     dispatch_async(dispatch_get_main_queue(), ^{
-        SDShowAlert(@"SubDump", msg);
+        SDShowReport(candText, detailText);
     });
 
-    SDLog(@"scan done: interesting=%lu all=%lu path=%@",
-          (unsigned long)interesting.count, (unsigned long)allURLs.count, path);
-    return path;
+    SDLog(@"scan done: candidates=%lu all=%lu",
+          (unsigned long)ranked.count, (unsigned long)allURLs.count);
 }
 
 #pragma mark - 悬浮按钮
