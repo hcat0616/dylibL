@@ -57,7 +57,9 @@ git push -u origin main
 | 【4】面板类 JSON | 从响应体里挖出的 `link` / `url` / `token` / `plan` / `expired` / `residue` 等字段 | `link` 一般就是订阅地址 |
 | 【5】候选链接 | 过滤掉规则集、测速、文档后的 URL，按分数排序，最多 40 条 | 兜底 |
 
-点「全部」能看到完整细节：所有响应、所有请求、UserDefaults、文件命中、全部 URL。
+面板顶部按钮：**全部 / 线索** 切换页面，**YAML** 复制整份 `config.yaml`（可以直接粘出来存成 `.yaml` 导入 Loon），**复制** 复制当前页，**关闭** 退出。
+
+【3】里每个 yaml 会给：文件路径、大小、`proxies` 节点数、`proxy-providers` 里的订阅 `url`、前 40 个节点名、`proxies` 前 12 行。如果节点显示不全，直接点 **YAML** 拿全文。
 
 结果**只存在于内存和剪贴板**，App 沙盒里不写任何文件。
 

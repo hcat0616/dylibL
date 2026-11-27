@@ -20,7 +20,7 @@
 #import <ctype.h>
 #import <stdarg.h>
 
-#define SD_VERSION   @"0.4.0"
+#define SD_VERSION   @"0.4.1"
 #define SD_BTN_TAG   0x5B0D1E
 #define SD_MAX_TEXT  (64 * 1024)
 
@@ -45,6 +45,7 @@ static NSString *SDTrim(NSString *s, NSUInteger n) {
 static NSMutableArray<NSString *> *gRequests;          // "GET url"
 static NSMutableArray<NSDictionary *> *gCaptures;      // {url,status,headers,body}
 static NSMutableArray<NSString *> *gProviderCfgs;      // NE providerConfiguration 转储
+static NSString *gBestYAML;                           // 最近扫到的最完整 config.yaml 全文
 static NSLock *gLock;
 
 #pragma mark - URL 提取
@@ -257,25 +258,78 @@ static NSArray<NSString *> *SDSandboxRoots(void) {
     return roots;
 }
 
-#pragma mark - YAML 片段
+#pragma mark - YAML 解析
 
-static NSString *SDYAMLSnippet(NSString *text) {
-    if (!text.length) return nil;
-    NSRange r = [text rangeOfString:@"proxy-providers:"];
-    if (r.location == NSNotFound) r = [text rangeOfString:@"proxies:"];
-    if (r.location == NSNotFound) r = [text rangeOfString:@"proxy-groups:"];
-    if (r.location == NSNotFound) return nil;
-    NSUInteger start = r.location;
-    NSUInteger len = MIN((NSUInteger)2400, text.length - start);
-    return [text substringWithRange:NSMakeRange(start, len)];
+// 取顶层键（proxies / proxy-providers / proxy-groups / rules）的整段内容
+static NSString *SDYamlBlock(NSString *text, NSString *key) {
+    if (!text.length || !key.length) return nil;
+    NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
+    NSString *head = [key stringByAppendingString:@":"];
+    NSInteger start = -1;
+    for (NSUInteger i = 0; i < lines.count; i++) {
+        if ([lines[i] hasPrefix:head]) { start = (NSInteger)i; break; }
+    }
+    if (start < 0) return nil;
+
+    NSMutableString *out = [NSMutableString string];
+    for (NSUInteger i = (NSUInteger)start; i < lines.count; i++) {
+        NSString *ln = lines[i];
+        if (i > (NSUInteger)start && ln.length &&
+            ![ln hasPrefix:@" "] && ![ln hasPrefix:@"\t"] && ![ln hasPrefix:@"-"] &&
+            ![ln hasPrefix:@"#"]) {
+            break;
+        }
+        [out appendFormat:@"%@\n", ln];
+        if (out.length > 20000) break;
+    }
+    return out.length ? out : nil;
 }
 
-static NSUInteger SDCountNodes(NSString *yaml) {
+// proxies 段里数节点：行首是 "- " 的都算（- name: / - {name: / - {...}）
+static NSUInteger SDCountProxyEntries(NSString *block) {
+    if (!block.length) return 0;
     NSUInteger n = 0;
-    for (NSString *ln in [yaml componentsSeparatedByString:@"\n"]) {
-        NSString *t = [ln stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
-        if ([t hasPrefix:@"- name:"] || [t hasPrefix:@"- {name:"] ||
-            [t hasPrefix:@"- { name:"]) n++;
+    for (NSString *ln in [block componentsSeparatedByString:@"\n"]) {
+        if ([ln hasPrefix:@"- "] || [ln hasPrefix:@"  - "] || [ln hasPrefix:@"    - "]) n++;
+    }
+    return n;
+}
+
+// 节点名预览
+static NSArray<NSString *> *SDProxyNames(NSString *block, NSUInteger limit) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (NSString *ln in [block componentsSeparatedByString:@"\n"]) {
+        NSRange r = [ln rangeOfString:@"name:"];
+        if (r.location == NSNotFound) continue;
+        if (![ln hasPrefix:@"- "] && ![ln hasPrefix:@"  - "] && ![ln hasPrefix:@"    - "]) continue;
+        NSString *name = [[ln substringFromIndex:r.location + r.length]
+                          stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        name = [name stringByTrimmingCharactersInSet:
+                [NSCharacterSet characterSetWithCharactersInString:@"\"'"]];
+        if (name.length) [out addObject:SDTrim(name, 40)];
+        if (out.count >= limit) break;
+    }
+    return out;
+}
+
+static NSString *SDProviderURL(NSString *provBlock) {
+    return SDRegexFirst(provBlock, @"(?m)^\\s*url:\\s*['\"]?(https?://[^\\s'\"]+)");
+}
+
+// 计数用于响应体判断（不做行首假设）
+static NSUInteger SDCountNodes(NSString *yaml) {
+    if (!yaml.length) return 0;
+    NSUInteger n = 0;
+    for (NSString *pat in @[ @"- name:", @"- {name:", @"- { name:" ]) {
+        NSUInteger loc = 0;
+        while (loc < yaml.length) {
+            NSRange r = [yaml rangeOfString:pat
+                                    options:0
+                                      range:NSMakeRange(loc, yaml.length - loc)];
+            if (r.location == NSNotFound) break;
+            n++;
+            loc = r.location + r.length;
+        }
     }
     return n;
 }
@@ -284,10 +338,10 @@ static NSUInteger SDCountNodes(NSString *yaml) {
 
 static void SDScanFiles(NSArray<NSString *> *roots,
                         NSMutableArray<NSString *> *lines,
-                        NSMutableArray<NSString *> *yamlLines,
+                        NSMutableArray<NSDictionary *> *yamlFiles,
                         NSMutableOrderedSet<NSString *> *allURLs) {
     NSFileManager *fm = [NSFileManager defaultManager];
-    NSUInteger files = 0, hitFiles = 0, yamlFiles = 0;
+    NSUInteger files = 0, hitFiles = 0;
     unsigned long long total = 0;
 
     for (NSString *root in roots) {
@@ -320,21 +374,26 @@ static void SDScanFiles(NSArray<NSString *> *roots,
                     [allURLs unionOrderedSet:found];
                 }
 
-                // yaml：只解析文本，抽出 proxies / proxy-providers 段落
-                NSString *lower = rel.lowercaseString;
-                BOOL nameYAML = [lower hasSuffix:@".yaml"] || [lower hasSuffix:@".yml"];
-                if ((nameYAML || size < 16ULL * 1024 * 1024) && data.length < 16ULL * 1024 * 1024) {
+                // yaml：解析出 proxies / proxy-providers 段落
+                if (data.length < 16ULL * 1024 * 1024) {
                     NSString *text = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding];
                     if (text && ([text containsString:@"proxies:"] ||
                                  [text containsString:@"proxy-providers:"])) {
-                        yamlFiles++;
-                        NSString *snip = SDYAMLSnippet(text);
-                        if (snip) {
-                            NSUInteger nodes = SDCountNodes(snip);
-                            [yamlLines addObject:[NSString stringWithFormat:
-                                @"== %@  (%.1f KB, 约 %lu 个节点)\n%@",
-                                full, size / 1024.0, (unsigned long)nodes, snip]];
-                            [allURLs unionOrderedSet:SDExtractURLsFromString(snip)];
+                        NSString *proxies = SDYamlBlock(text, @"proxies");
+                        NSString *provs = SDYamlBlock(text, @"proxy-providers");
+                        if (proxies.length || provs.length) {
+                            NSUInteger nodes = SDCountProxyEntries(proxies);
+                            [yamlFiles addObject:@{
+                                @"path": full,
+                                @"size": @(size),
+                                @"text": SDTrim(text, 200 * 1024),
+                                @"proxies": proxies ?: @"",
+                                @"providers": provs ?: @"",
+                                @"nodes": @(nodes),
+                                @"provURL": SDProviderURL(provs) ?: @""
+                            }];
+                            if (proxies.length) [allURLs unionOrderedSet:SDExtractURLsFromString(proxies)];
+                            if (provs.length) [allURLs unionOrderedSet:SDExtractURLsFromString(provs)];
                         }
                     }
                 }
@@ -345,7 +404,7 @@ static void SDScanFiles(NSArray<NSString *> *roots,
     [lines insertObject:[NSString stringWithFormat:
         @"扫描 %lu 个文件 / %.1f MB，命中 %lu 个，yaml 配置 %lu 个",
         (unsigned long)files, total / 1048576.0,
-        (unsigned long)hitFiles, (unsigned long)yamlFiles] atIndex:0];
+        (unsigned long)hitFiles, (unsigned long)yamlFiles.count] atIndex:0];
 }
 
 #pragma mark - 网络 / NE 观测
@@ -602,6 +661,13 @@ static void SDShowAlert(NSString *title, NSString *message) {
              forControlEvents:UIControlEventTouchUpInside];
     [card addSubview:self.switchBtn];
 
+    UIButton *yamlBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    yamlBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [yamlBtn setTitle:@"YAML" forState:UIControlStateNormal];
+    [yamlBtn addTarget:self action:@selector(copyYAML)
+      forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:yamlBtn];
+
     UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
     copyBtn.translatesAutoresizingMaskIntoConstraints = NO;
     [copyBtn setTitle:@"复制" forState:UIControlStateNormal];
@@ -642,7 +708,9 @@ static void SDShowAlert(NSString *title, NSString *message) {
         [closeBtn.centerYAnchor constraintEqualToAnchor:self.titleLabel.centerYAnchor],
         [copyBtn.trailingAnchor constraintEqualToAnchor:closeBtn.leadingAnchor constant:-10],
         [copyBtn.centerYAnchor constraintEqualToAnchor:self.titleLabel.centerYAnchor],
-        [self.switchBtn.trailingAnchor constraintEqualToAnchor:copyBtn.leadingAnchor constant:-10],
+        [yamlBtn.trailingAnchor constraintEqualToAnchor:copyBtn.leadingAnchor constant:-10],
+        [yamlBtn.centerYAnchor constraintEqualToAnchor:self.titleLabel.centerYAnchor],
+        [self.switchBtn.trailingAnchor constraintEqualToAnchor:yamlBtn.leadingAnchor constant:-10],
         [self.switchBtn.centerYAnchor constraintEqualToAnchor:self.titleLabel.centerYAnchor],
 
         [self.textView.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:12],
@@ -675,6 +743,27 @@ static void SDShowAlert(NSString *title, NSString *message) {
 
 - (void)closeSelf {
     [self dismissViewControllerAnimated:YES completion:nil];
+}
+
+- (void)copyYAML {
+    [gLock lock];
+    NSString *yaml = [gBestYAML copy];
+    [gLock unlock];
+    if (!yaml.length) {
+        [self flashTitle:@"没有 yaml"];
+        return;
+    }
+    UIPasteboard.generalPasteboard.string = yaml;
+    [self flashTitle:@"已复制 YAML"];
+}
+
+- (void)flashTitle:(NSString *)text {
+    NSString *old = self.titleLabel.text;
+    self.titleLabel.text = text;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (self.titleLabel) self.titleLabel.text = old;
+    });
 }
 
 @end
@@ -829,7 +918,7 @@ static void SDRunScan(NSString *reason) {
 
     NSMutableArray<NSString *> *flat = [NSMutableArray array];
     NSMutableArray<NSString *> *fileLines = [NSMutableArray array];
-    NSMutableArray<NSString *> *yamlLines = [NSMutableArray array];
+    NSMutableArray<NSDictionary *> *yamlFiles = [NSMutableArray array];
     NSMutableOrderedSet<NSString *> *allURLs = [NSMutableOrderedSet orderedSet];
 
     [gLock lock];
@@ -847,7 +936,49 @@ static void SDRunScan(NSString *reason) {
 
     // 2. 沙盒 + AppGroup
     NSArray<NSString *> *roots = SDSandboxRoots();
-    @try { SDScanFiles(roots, fileLines, yamlLines, allURLs); } @catch (__unused NSException *e) {}
+    @try { SDScanFiles(roots, fileLines, yamlFiles, allURLs); } @catch (__unused NSException *e) {}
+
+    // 2b. 把 yaml 整理成可读摘要，并留一份完整文本供「YAML」按钮复制
+    NSMutableArray<NSString *> *yamlLines = [NSMutableArray array];
+    NSDictionary *bestYAML = nil;
+    NSUInteger bestNodes = 0;
+    for (NSDictionary *y in yamlFiles) {
+        NSUInteger nodes = [y[@"nodes"] unsignedIntegerValue];
+        NSString *path = y[@"path"];
+        NSString *provURL = y[@"provURL"];
+        NSString *providers = y[@"providers"];
+        NSString *proxies = y[@"proxies"];
+
+        NSMutableString *e = [NSMutableString string];
+        [e appendFormat:@"== %@\n", path];
+        [e appendFormat:@"   %.1f KB, proxies 节点 %lu 个\n",
+         [y[@"size"] doubleValue] / 1024.0, (unsigned long)nodes];
+        if (provURL.length) {
+            [e appendFormat:@"   ★ 订阅源 url = %@\n", provURL];
+        }
+        if (providers.length) {
+            [e appendFormat:@"   --- proxy-providers ---\n%@\n", SDTrim(providers, 1200)];
+        }
+        if (proxies.length) {
+            NSArray<NSString *> *names = SDProxyNames(proxies, 40);
+            if (names.count) {
+                [e appendFormat:@"   节点名: %@%@\n",
+                 [names componentsJoinedByString:@", "],
+                 nodes > names.count ? @" …" : @""];
+            }
+            [e appendFormat:@"   --- proxies 前 12 行 ---\n%@\n", SDTrim(proxies, 1200)];
+        }
+        [yamlLines addObject:e];
+
+        if (nodes > bestNodes) {
+            bestNodes = nodes;
+            bestYAML = y;
+        }
+    }
+    if (!bestYAML && yamlFiles.count) bestYAML = yamlFiles.firstObject;
+    [gLock lock];
+    gBestYAML = bestYAML[@"text"] ?: @"";
+    [gLock unlock];
 
     // 3. 响应分类
     NSMutableArray<NSString *> *subLines = [NSMutableArray array];
@@ -894,7 +1025,10 @@ static void SDRunScan(NSString *reason) {
     if (yamlLines.count == 0) {
         [cand appendString:@"  （没找到 config.yaml，可能还没连过一次 VPN）\n"];
     }
-    for (NSString *y in yamlLines) [cand appendFormat:@"%@\n", SDTrim(y, 4000)];
+    if (yamlLines.count) {
+        [cand appendString:@"  （点顶部「YAML」按钮可复制整份 config.yaml）\n"];
+    }
+    for (NSString *y in yamlLines) [cand appendFormat:@"%@\n", SDTrim(y, 6000)];
 
     [cand appendFormat:@"\n【4】面板类 JSON %lu 条\n", (unsigned long)jsonLines.count];
     for (NSString *j in jsonLines) [cand appendFormat:@"%@\n", j];
@@ -914,8 +1048,13 @@ static void SDRunScan(NSString *reason) {
     for (NSString *p in provs) [details appendFormat:@"%@\n", p];
     [details appendFormat:@"\n=== 订阅类响应（%lu）===\n", (unsigned long)subLines.count];
     for (NSString *s in subLines) [details appendFormat:@"%@\n", s];
-    [details appendFormat:@"\n=== 本地 yaml（%lu）===\n", (unsigned long)yamlLines.count];
+    [details appendFormat:@"\n=== 本地 yaml 摘要（%lu）===\n", (unsigned long)yamlLines.count];
     for (NSString *y in yamlLines) [details appendFormat:@"%@\n", y];
+    [details appendFormat:@"\n=== 本地 yaml 全文（%lu）===\n", (unsigned long)yamlFiles.count];
+    for (NSDictionary *y in yamlFiles) {
+        [details appendFormat:@"\n##### %@ #####\n%@\n",
+         y[@"path"], SDTrim(y[@"text"], 60 * 1024)];
+    }
     [details appendFormat:@"\n=== 面板 JSON（%lu）===\n", (unsigned long)jsonLines.count];
     for (NSString *j in jsonLines) [details appendFormat:@"%@\n", j];
     [details appendFormat:@"\n=== 其它响应（%lu）===\n", (unsigned long)otherLines.count];
